@@ -1,0 +1,41 @@
+{
+  "name": "razorpay-recover",
+  "version": "1.0.0",
+  "description": "Node.js + TypeScript Payment Recovery Service using PostgreSQL",
+  "main": "dist/server.js",
+  "scripts": {
+    "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
+    "init-db": "node scripts/init-db.js",
+    "reset-db": "node scripts/reset-db.js",
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "test": "npx ts-node scripts/test-all.ts",
+    "test:webhook": "npx ts-node scripts/test-webhook.ts",
+    "test:units": "npx ts-node scripts/test-units.ts",
+    "test:batch": "npx ts-node scripts/test-batch.ts",
+    "test:promise": "npx ts-node scripts/test-promise-to-pay.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "groq-sdk": "^1.6.0",
+    "luxon": "^3.7.2",
+    "openai": "^7.9.0",
+    "pg": "^8.23.0",
+    "razorpay": "^2.9.8",
+    "twilio": "^6.1.0",
+    "zod": "^4.5.4"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/luxon": "^3.7.5",
+    "@types/node": "^26.4.1",
+    "@types/pg": "^8.23.1",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.9.3"
+  }
+}
