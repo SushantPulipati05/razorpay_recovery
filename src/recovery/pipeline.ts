@@ -67,6 +67,17 @@ export async function claimEvent(eventKey: string): Promise<boolean> {
   return (result.rowCount ?? 0) > 0;
 }
 
+/**
+ * Statuses from which a nudge may be sent. A manual (dashboard) resend must
+ * never override a customer's promise to pay or a halted/finished recovery;
+ * the scheduler may resume PROMISE_TO_PAY once the promised time has passed.
+ */
+function nudgeableStatuses(opts: { manual?: boolean }): string[] {
+  return opts.manual
+    ? ['PENDING', 'INTERVENING', 'DEFERRED']
+    : ['PENDING', 'INTERVENING', 'DEFERRED', 'PROMISE_TO_PAY'];
+}
+
 function checkoutMethods(strategy: DiagnosedStrategy): { upi: boolean; card: boolean; netbanking: boolean; wallet: boolean } {
   if (strategy === 'BANK_OUTAGE_ALTERNATIVE_RAIL') {
     return { upi: true, card: false, netbanking: false, wallet: false };
@@ -299,6 +310,37 @@ export async function runIntervention(
     };
   }
 
+    // Reserve this attempt atomically BEFORE any side effect (payment link,
+  // WhatsApp). The check (attempts < MAX, status still nudgeable) and the
+  // increment happen in one UPDATE, so if a dashboard resend and the scheduler
+  // (or two server instances) race, exactly one wins the attempt and the rest
+  // get no row back and send nothing. Previously the count was read, the
+  // message sent, and only then incremented: every racer saw the old count.
+  const claim = await query<{ attempts_count: number }>(
+    `UPDATE transaction_failures
+     SET attempts_count = attempts_count + 1,
+         status = 'INTERVENING',
+         updated_at = CURRENT_TIMESTAMP
+     WHERE id = $1
+       AND attempts_count < $2
+       AND status = ANY($3::text[])
+     RETURNING attempts_count`,
+    [tx.id, PolicyEngine.MAX_ATTEMPTS, nudgeableStatuses(opts)]
+  );
+  if (claim.rowCount === 0) {
+    await audit(
+      tx.id,
+      'NUDGE_SKIPPED',
+      'Attempt not reserved: the attempt cap was reached or the status changed (e.g. a concurrent nudge, payment, or promise-to-pay). Nothing sent.'
+    );
+    return {
+      status: 'skipped',
+      transactionId: tx.id,
+      reason: 'Attempt cap reached or transaction state changed concurrently; nothing sent'
+    };
+  }
+  const attemptNumber = claim.rows[0].attempts_count;
+
   const discountPercent = policy.approvedDiscountPercent;
   const discountAmount = policy.approvedDiscountAmount;
   const discountedAmount = Number((originalAmount - discountAmount).toFixed(2));
@@ -318,7 +360,7 @@ export async function runIntervention(
         ? `Overdue invoice ${tx.razorpay_order_id}`
         : lossMode === 'SUBSCRIPTION_FAILED'
           ? `Subscription retry ${tx.razorpay_order_id}`
-          : `Recovery attempt ${attemptsCount + 1}/3 for ${tx.razorpay_order_id}`
+                    : `Recovery attempt ${attemptNumber}/${PolicyEngine.MAX_ATTEMPTS} for ${tx.razorpay_order_id}`
   });
 
   const copyResult = await RecoveryAgent.generateCopy({
@@ -342,16 +384,14 @@ export async function runIntervention(
 
   const stepCost = copyResult.source === 'groq' ? 0.06 : NUDGE_COST;
   const stepName = opts.manual
-    ? `MANUAL_NUDGE_ATTEMPT_${attemptsCount + 1}`
+    ? `MANUAL_NUDGE_ATTEMPT_${attemptNumber}`
     : opts.isRetry
-      ? `RETRY_NUDGE_ATTEMPT_${attemptsCount + 1}`
+      ? `RETRY_NUDGE_ATTEMPT_${attemptNumber}`
       : 'RECOVERY_NUDGE_DISPATCHED';
-
+    
   await query(
     `UPDATE transaction_failures
-     SET status='INTERVENING',
-         diagnosed_strategy=$1,
-         attempts_count=attempts_count+1,
+        SET diagnosed_strategy=$1,
          total_discount_given=total_discount_given+$2,
          total_cost_incurred=total_cost_incurred+$3,
          payment_link_id=$4,
@@ -374,7 +414,7 @@ export async function runIntervention(
     status: 'intervention_dispatched',
     transactionId: tx.id,
     recoveryStatus: 'INTERVENING',
-    attemptsCount: attemptsCount + 1,
+    attemptsCount: attemptNumber,
     aiDiagnosis: { category: diagnosis.category, strategy: diagnosis.strategy },
     approvedDiscount: discountAmount,
     paymentLink: linkResult.shortUrl,
@@ -411,6 +451,16 @@ export async function manualNudge(transactionId: string): Promise<IngestResult> 
     return { status: 'error', reason: 'Transaction not found' };
   }
   const tx = result.rows[0];
+    // Fail fast with a clear reason. The atomic claim in runIntervention is what
+  // actually guarantees this even under races; this just avoids extra work.
+  if (!nudgeableStatuses({ manual: true }).includes(tx.status)) {
+    return {
+      status: 'blocked',
+      transactionId: tx.id,
+      recoveryStatus: tx.status,
+      reason: `Manual nudge not allowed while status is ${tx.status}`
+    };
+  }
   const diagnosis = await DiagnosticClassifier.classify({
     errorCode: tx.error_code || tx.failure_reason,
     errorDescription: tx.error_description || undefined,
