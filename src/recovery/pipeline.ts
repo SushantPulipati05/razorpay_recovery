@@ -1,5 +1,5 @@
 import { DateTime } from 'luxon';
-import { query } from '../config/db';
+import { pool, query, Queryable, withTransaction } from '../config/db';
 import { DiagnosticClassifier } from '../agent/diagnosticClassifier';
 import { RecoveryAgent } from '../agent/recoveryAgent';
 import { PolicyEngine } from '../guardrails/policyEngine';
@@ -52,21 +52,26 @@ export interface IngestResult {
   nextRetryAt?: string;
 }
 
-async function audit(txId: string, step: string, reasoning: string, cost = 0): Promise<void> {
-  await query(
+async function audit(txId: string, step: string, reasoning: string, cost = 0, db: Queryable = pool): Promise<void> {
+  await db.query(
     `INSERT INTO audit_logs (transaction_id, step, reasoning, cost_incurred) VALUES ($1, $2, $3, $4)`,
     [txId, step, reasoning, cost]
   );
 }
 
-export async function claimEvent(eventKey: string): Promise<boolean> {
-  const result = await query(
+/**
+ * Records that an event has been seen. Returns false if it was seen before.
+ * Pass a transaction client so the claim commits (or rolls back) together with
+ * the work it protects; a claim committed on its own, before the work, is how
+ * events used to get lost.
+ */
+export async function claimEvent(eventKey: string, db: Queryable = pool): Promise<boolean> {
+  const result = await db.query(
     `INSERT INTO processed_events (event_key) VALUES ($1) ON CONFLICT (event_key) DO NOTHING RETURNING event_key`,
     [eventKey]
   );
   return (result.rowCount ?? 0) > 0;
 }
-
 /**
  * Statuses from which a nudge may be sent. A manual (dashboard) resend must
  * never override a customer's promise to pay or a halted/finished recovery;
@@ -86,8 +91,41 @@ function checkoutMethods(strategy: DiagnosedStrategy): { upi: boolean; card: boo
 }
 
 export async function ingestFailure(input: FailureIngest): Promise<IngestResult> {
-  const claimed = await claimEvent(input.eventKey);
-  if (!claimed) {
+  // Step 1: durably RECORD the event, and nothing else, in one transaction.
+  // Claiming the event and saving the failure row commit together, so we can
+  // never end up with "event marked processed" but no row (or vice versa).
+  // This is fast and touches only our database, so it is safe to hold a
+  // transaction for it. Slow external calls (Groq, Razorpay, WhatsApp) happen
+  // afterwards, outside any transaction.
+  const recorded = await withTransaction(async (client) => {
+    const claimed = await claimEvent(input.eventKey, client);
+    if (!claimed) return null;
+    const inserted = await client.query<TransactionFailureRow>(
+      `INSERT INTO transaction_failures (
+         razorpay_pay_id, razorpay_order_id, customer_phone, customer_email,
+         original_amount, failure_reason, failure_source, status, attempts_count,
+         loss_mode, error_code, error_description, error_step
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'PENDING', 0, $8, $9, $10, $11)
+       ON CONFLICT (razorpay_pay_id) DO UPDATE SET updated_at = CURRENT_TIMESTAMP
+       RETURNING *`,
+      [
+        input.payId,
+        input.orderId,
+        input.customerPhone,
+        input.customerEmail,
+        input.originalAmount,
+        input.failureReason,
+        input.failureSource,
+        input.lossMode,
+        input.errorCode || null,
+        input.errorDescription || null,
+        input.errorStep || null
+      ]
+    );
+    return inserted.rows[0];
+  });
+
+  if (!recorded) {
     const existing = await query<TransactionFailureRow>(
       `SELECT * FROM transaction_failures WHERE razorpay_pay_id = $1`,
       [input.payId]
@@ -101,30 +139,7 @@ export async function ingestFailure(input: FailureIngest): Promise<IngestResult>
     };
   }
 
-  const txResult = await query<TransactionFailureRow>(
-    `INSERT INTO transaction_failures (
-       razorpay_pay_id, razorpay_order_id, customer_phone, customer_email,
-       original_amount, failure_reason, failure_source, status, attempts_count,
-       loss_mode, error_code, error_description, error_step
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'PENDING', 0, $8, $9, $10, $11)
-     ON CONFLICT (razorpay_pay_id) DO UPDATE SET updated_at = CURRENT_TIMESTAMP
-     RETURNING *`,
-    [
-      input.payId,
-      input.orderId,
-      input.customerPhone,
-      input.customerEmail,
-      input.originalAmount,
-      input.failureReason,
-      input.failureSource,
-      input.lossMode,
-      input.errorCode || null,
-      input.errorDescription || null,
-      input.errorStep || null
-    ]
-  );
-
-  const tx = txResult.rows[0];
+  const tx = recorded;
   if (tx.attempts_count > 0 || ['INTERVENING', 'RECOVERED', 'HOLDOUT', 'HALTED_EXHAUSTED', 'DEFERRED'].includes(tx.status)) {
     return {
       status: 'already_processed',
@@ -135,29 +150,53 @@ export async function ingestFailure(input: FailureIngest): Promise<IngestResult>
     };
   }
 
+  // Step 2: PROCESS it. If this fails part-way (Groq down, DB hiccup, crash),
+  // the row stays PENDING and the retry scheduler picks it up later. The event
+  // is never lost, and we still answer 200 because it is safely recorded.
+  try {
+    return await processRecordedFailure(tx, {
+      forceCohort: input.forceCohort,
+      forceQuietHours: input.forceQuietHours
+    });
+  } catch (err: any) {
+    console.error(`[Pipeline] Processing failed for tx ${tx.id}; will retry from the scheduler: ${err.message}`);
+    await audit(tx.id, 'PROCESSING_FAILED_WILL_RETRY', String(err.message || err)).catch(() => {});
+    return {
+      status: 'accepted',
+      transactionId: tx.id,
+      recoveryStatus: 'PENDING',
+      reason: 'Recorded; processing failed and will be retried by the scheduler'
+    };
+  }
+}
+
+/**
+ * Diagnoses a recorded failure and starts its recovery (holdout, halt, defer or
+ * nudge). Works purely from the stored row, so the scheduler can run it again
+ * for a row whose first processing attempt never finished.
+ */
+export async function processRecordedFailure(
+  tx: TransactionFailureRow,
+  opts: { forceCohort?: RecoveryCohort; forceQuietHours?: boolean } = {}
+): Promise<IngestResult> {
+  const lossMode = (tx.loss_mode || 'PAYMENT_FAILED') as LossMode;
   const diagnosis = await DiagnosticClassifier.classify({
-    errorCode: input.errorCode || input.failureReason,
-    errorDescription: input.errorDescription,
-    errorSource: input.failureSource,
-    errorStep: input.errorStep
+    errorCode: tx.error_code || tx.failure_reason,
+    errorDescription: tx.error_description || undefined,
+    errorSource: tx.failure_source,
+    errorStep: tx.error_step || undefined
   });
 
   await query(
     `UPDATE transaction_failures
      SET diagnosed_strategy = $1,
-         error_code = $2,
-         error_description = $3,
-         error_step = $4,
-         rule_strategy = $5,
-         groq_strategy = $6,
-         diagnosis_disagreed = $7,
+         rule_strategy = $2,
+         groq_strategy = $3,
+         diagnosis_disagreed = $4,
          updated_at = CURRENT_TIMESTAMP
-     WHERE id = $8`,
+     WHERE id = $5`,
     [
       diagnosis.strategy,
-      input.errorCode || null,
-      input.errorDescription || null,
-      input.errorStep || null,
       diagnosis.ruleStrategy || diagnosis.strategy,
       diagnosis.groqStrategy || null,
       Boolean(diagnosis.disagreed),
@@ -168,7 +207,7 @@ export async function ingestFailure(input: FailureIngest): Promise<IngestResult>
   await audit(
     tx.id,
     'AI_DIAGNOSIS',
-    `${diagnosis.explanation} | loss_mode=${input.lossMode} strategy=${diagnosis.strategy} source=${diagnosis.source || 'rules'}`
+    `${diagnosis.explanation} | loss_mode=${lossMode} strategy=${diagnosis.strategy} source=${diagnosis.source || 'rules'}`
   );
 
   if (diagnosis.disagreed) {
@@ -194,7 +233,7 @@ export async function ingestFailure(input: FailureIngest): Promise<IngestResult>
     };
   }
 
-  const cohort = assignCohort(input.payId, input.forceCohort);
+  const cohort = assignCohort(tx.razorpay_pay_id, opts.forceCohort);
   if (cohort === 'holdout') {
     await query(
       `UPDATE transaction_failures SET status='HOLDOUT', is_holdout=TRUE, diagnosed_strategy=$1, updated_at=CURRENT_TIMESTAMP WHERE id=$2`,
@@ -211,7 +250,7 @@ export async function ingestFailure(input: FailureIngest): Promise<IngestResult>
     };
   }
 
-  return runIntervention(tx, diagnosis, { isRetry: false, forceQuietHours: input.forceQuietHours });
+  return runIntervention(tx, diagnosis, { isRetry: false, forceQuietHours: opts.forceQuietHours });
 }
 
 export async function runIntervention(
@@ -470,14 +509,46 @@ export async function manualNudge(transactionId: string): Promise<IngestResult> 
   return runIntervention(tx, diagnosis, { isRetry: true, manual: true });
 }
 
-export async function confirmRecovery(params: {
+export interface RecoveryConfirmation {
   amount: number;
   sourceEvent: string;
   paymentLinkId?: string | null;
   orderId?: string | null;
   payId?: string | null;
   recoveryTxId?: string | null;
-}): Promise<{ status: string; transactionId?: string; recoveredAmount?: number; recoveryStatus?: string; reason?: string }> {
+}
+
+export type RecoveryConfirmationResult = {
+  status: string;
+  transactionId?: string;
+  recoveredAmount?: number;
+  recoveryStatus?: string;
+  reason?: string;
+};
+
+/**
+ * Handles a "customer paid" event exactly once: claiming the event and marking
+ * the transaction RECOVERED commit in ONE transaction. If anything fails, both
+ * roll back, so Razorpay's retry is processed instead of being rejected as a
+ * duplicate (which used to leave paying customers being chased).
+ */
+export async function confirmRecoveryOnce(
+  eventKey: string,
+  params: RecoveryConfirmation
+): Promise<RecoveryConfirmationResult> {
+  return withTransaction(async (client) => {
+    const claimed = await claimEvent(eventKey, client);
+    if (!claimed) {
+      return { status: 'already_processed', reason: eventKey };
+    }
+    return confirmRecovery(params, client);
+  });
+}
+
+export async function confirmRecovery(
+  params: RecoveryConfirmation,
+  db: Queryable = pool
+): Promise<RecoveryConfirmationResult> {
   const conditions: string[] = [];
   const values: any[] = [params.amount];
   let i = 2;
@@ -507,7 +578,7 @@ export async function confirmRecovery(params: {
     return { status: 'ignored', reason: 'No identifiers to match a recovery record' };
   }
 
-  const update = await query<TransactionFailureRow>(
+  const update = await db.query<TransactionFailureRow>(
     `UPDATE transaction_failures
      SET status = 'RECOVERED',
          recovered_amount = $1,
@@ -526,7 +597,9 @@ export async function confirmRecovery(params: {
   await audit(
     recovered.id,
     'PAYMENT_RECOVERED',
-    `Attributed via ${params.sourceEvent}. pay=${params.payId || 'n/a'} link=${params.paymentLinkId || 'n/a'} order=${params.orderId || 'n/a'} amount=₹${params.amount} holdout=${recovered.is_holdout}`
+    `Attributed via ${params.sourceEvent}. pay=${params.payId || 'n/a'} link=${params.paymentLinkId || 'n/a'} order=${params.orderId || 'n/a'} amount=₹${params.amount} holdout=${recovered.is_holdout}`,
+    0,
+    db
   );
 
   return {

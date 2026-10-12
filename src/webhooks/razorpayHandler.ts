@@ -1,7 +1,7 @@
 import { Request, Response } from 'express';
 import crypto from 'crypto';
 import { env } from '../config/env';
-import { claimEvent, confirmRecovery, ingestFailure } from '../recovery/pipeline';
+import { confirmRecoveryOnce, ingestFailure } from '../recovery/pipeline';
 import { RecoveryCohort } from '../recovery/cohort';
 
 export interface WebhookRequest extends Request {
@@ -125,13 +125,9 @@ export async function razorpayWebhookHandler(req: WebhookRequest, res: Response)
       const link = payload?.payload?.payment_link?.entity;
       const payment = payload?.payload?.payment?.entity;
       const eventKey = `payment_link.paid:${link?.id || payment?.id || Date.now()}`;
-      const claimed = await claimEvent(eventKey);
-      if (!claimed) {
-        res.status(200).json({ status: 'already_processed', reason: eventKey });
-        return;
-      }
       const amount = payment?.amount ? payment.amount / 100 : link?.amount ? link.amount / 100 : 0;
-      const result = await confirmRecovery({
+      // Claim + mark RECOVERED in one transaction (see confirmRecoveryOnce).
+      const result = await confirmRecoveryOnce(eventKey, {
         amount,
         sourceEvent: event,
         paymentLinkId: link?.id,
@@ -150,13 +146,8 @@ export async function razorpayWebhookHandler(req: WebhookRequest, res: Response)
         return;
       }
       const eventKey = `${event}:${payment.id}`;
-      const claimed = await claimEvent(eventKey);
-      if (!claimed) {
-        res.status(200).json({ status: 'already_processed' });
-        return;
-      }
       const notes = payment.notes || {};
-      const result = await confirmRecovery({
+      const result = await confirmRecoveryOnce(eventKey, {
         amount: payment.amount ? payment.amount / 100 : 0,
         sourceEvent: event,
         paymentLinkId: notes.payment_link_id || payment.payment_link_id,

@@ -1,4 +1,4 @@
-import { Pool, QueryResult, QueryResultRow } from 'pg';
+import { Pool, PoolClient, QueryResult, QueryResultRow } from 'pg';
 import { env } from './env';
 
 export const pool = new Pool({
@@ -21,3 +21,26 @@ export const query = async <T extends QueryResultRow = any>(
   }
   return res;
 };
+
+/** Something that can run a query: the pool, or a client inside a transaction. */
+export type Queryable = Pick<Pool | PoolClient, 'query'>;
+
+/**
+ * Runs fn inside a single database transaction. If fn throws, everything it
+ * wrote is rolled back; otherwise it is committed. Use it when several writes
+ * must succeed or fail together.
+ */
+export async function withTransaction<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await fn(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}

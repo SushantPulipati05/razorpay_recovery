@@ -1,6 +1,6 @@
 import { query } from '../config/db';
 import { env } from '../config/env';
-import { retryDueTransaction } from '../recovery/pipeline';
+import { processRecordedFailure, retryDueTransaction } from '../recovery/pipeline';
 import { retryDelaysHours } from '../recovery/schedule';
 import { TransactionFailureRow } from '../types/db';
 
@@ -28,6 +28,11 @@ function sleep(ms: number): Promise<void> {
 // twice). This flag makes a new pass skip instead of overlapping.
 let isRunning = false;
 
+// A failure recorded by the webhook is normally processed within seconds. If it
+// is still PENDING with no attempts after this long, its first processing
+// attempt failed or the process crashed mid-way, so the scheduler finishes it.
+const STUCK_PENDING_MS = 5 * 60 * 1000;
+
 export async function runRetryCheck(): Promise<void> {
   if (isRunning) {
     console.log('[RetryScheduler] Previous check still running — skipping this cycle to avoid double-dispatch.');
@@ -40,12 +45,15 @@ export async function runRetryCheck(): Promise<void> {
     const delays = retryDelaysHours();
     const attempt1Cutoff = new Date(Date.now() - delays.attempt1 * 60 * 60 * 1000);
     const attempt2Cutoff = new Date(Date.now() - delays.attempt2 * 60 * 60 * 1000);
+    const stuckPendingCutoff = new Date(Date.now() - STUCK_PENDING_MS);
 
     const result = await query<TransactionFailureRow>(
       `SELECT * FROM transaction_failures
        WHERE attempts_count < 3
          AND status NOT IN ('RECOVERED', 'HALTED_EXHAUSTED', 'HOLDOUT')
          AND (
+           (status = 'PENDING' AND attempts_count = 0 AND updated_at < $3)
+           OR
            (status = 'DEFERRED' AND next_retry_at IS NOT NULL AND next_retry_at <= NOW())
            OR
            (status = 'PROMISE_TO_PAY' AND promise_at IS NOT NULL AND promise_at <= NOW())
@@ -57,7 +65,7 @@ export async function runRetryCheck(): Promise<void> {
          )
        ORDER BY COALESCE(next_retry_at, promise_at, updated_at) ASC
        LIMIT 20`,
-      [attempt1Cutoff, attempt2Cutoff]
+      [attempt1Cutoff, attempt2Cutoff, stuckPendingCutoff]
     );
 
     if (result.rows.length === 0) {
@@ -70,7 +78,11 @@ export async function runRetryCheck(): Promise<void> {
     for (let i = 0; i < result.rows.length; i++) {
       const tx = result.rows[i];
       try {
-        const out = await retryDueTransaction(tx);
+        // A stuck PENDING row never finished its first processing; run that.
+        // Everything else is a follow-up nudge.
+        const out = tx.status === 'PENDING'
+          ? await processRecordedFailure(tx)
+          : await retryDueTransaction(tx);
         console.log(`[RetryScheduler] tx ${tx.id} → ${out.status} (${out.recoveryStatus})`);
       } catch (err: any) {
         console.error(`[RetryScheduler] Error retrying tx ${tx.id}: ${err.message}`);
