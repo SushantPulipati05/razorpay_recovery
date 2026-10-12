@@ -14,7 +14,7 @@
     "test:units": "npx ts-node scripts/test-units.ts",
     "test:batch": "npx ts-node scripts/test-batch.ts",
     "test:promise": "npx ts-node scripts/test-promise-to-pay.ts",
-    "test:db": "node --require ./test/setup-env.cjs --import tsx --test test/*.test.ts"
+    "test:db": "node --require ./test/setup-env.cjs --import tsx --test --test-concurrency=1 test/*.test.ts"
   },
   "keywords": [],
   "author": "",

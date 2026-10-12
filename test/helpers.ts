@@ -61,3 +61,41 @@ export async function countNudgesSent(id: string): Promise<number> {
   );
   return res.rows[0].n;
 }
+
+/** Signs and delivers a Razorpay webhook to the real handler; returns the HTTP status and body. */
+export async function deliverWebhook(payload: object): Promise<{ status: number; body: any }> {
+  const { razorpayWebhookHandler } = await import('../src/webhooks/razorpayHandler');
+  const crypto = await import('node:crypto');
+  const raw = Buffer.from(JSON.stringify(payload));
+  const signature = crypto
+    .createHmac('sha256', process.env.RAZORPAY_WEBHOOK_SECRET as string)
+    .update(raw)
+    .digest('hex');
+
+  const req: any = { headers: { 'x-razorpay-signature': signature }, rawBody: raw, body: payload };
+  const out = { status: 0, body: undefined as any };
+  const res: any = {
+    status(code: number) { out.status = code; return res; },
+    json(body: any) { out.body = body; return res; }
+  };
+  await razorpayWebhookHandler(req, res);
+  return out;
+}
+
+/**
+ * Simulates a database outage on one table: every write to it fails until
+ * restoreTable() is called. Used to prove that a failure mid-processing does
+ * not lose the event.
+ */
+export async function breakTable(table: 'transaction_failures' | 'audit_logs'): Promise<void> {
+  await query(`
+    CREATE OR REPLACE FUNCTION test_simulated_outage() RETURNS trigger AS $$
+    BEGIN RAISE EXCEPTION 'simulated database outage'; END $$ LANGUAGE plpgsql`);
+  await query(`DROP TRIGGER IF EXISTS test_outage ON ${table}`);
+  await query(`CREATE TRIGGER test_outage BEFORE INSERT OR UPDATE ON ${table}
+               FOR EACH ROW EXECUTE FUNCTION test_simulated_outage()`);
+}
+
+export async function restoreTable(table: 'transaction_failures' | 'audit_logs'): Promise<void> {
+  await query(`DROP TRIGGER IF EXISTS test_outage ON ${table}`);
+}
