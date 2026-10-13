@@ -5,8 +5,11 @@ import { razorpayWebhookHandler, WebhookRequest } from './webhooks/razorpayHandl
 import { twilioReplyHandler } from './webhooks/twilioReplyHandler';
 import { runRetryCheck, startRetryScheduler } from './jobs/retryScheduler';
 import { ingestFailure, loadSummary, manualNudge } from './recovery/pipeline';
+import { adminAuth, safeEqual } from './security/adminAuth';
 
 const app = express();
+
+const requireAdmin = adminAuth({ key: env.ADMIN_API_KEY, production: env.NODE_ENV === 'production' });
 
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
@@ -40,7 +43,7 @@ app.get('/health', async (_req: Request, res: Response) => {
       dbTime: dbTest.rows[0].current_time
     });
   } catch (err: any) {
-    res.status(200).json({
+    res.status(503).json({
       status: 'degraded',
       service: 'razorpay-recover',
       timestamp: new Date().toISOString(),
@@ -67,7 +70,7 @@ app.get('/api/summary', async (_req: Request, res: Response) => {
   }
 });
 
-app.get('/api/failures', async (_req: Request, res: Response) => {
+app.get('/api/failures', requireAdmin, async (_req: Request, res: Response) => {
   try {
     const result = await query(
       `SELECT tf.*,
@@ -90,7 +93,7 @@ app.get('/api/failures', async (_req: Request, res: Response) => {
   }
 });
 
-app.post('/api/nudge', async (req: Request, res: Response) => {
+app.post('/api/nudge',requireAdmin, async (req: Request, res: Response) => {
   try {
     const transactionId = req.body?.transactionId;
     if (!transactionId) {
@@ -111,7 +114,7 @@ app.post('/api/nudge', async (req: Request, res: Response) => {
 
 app.post('/api/ingest/receivable', async (req: Request, res: Response) => {
   const secret = req.headers['x-ingest-secret'] as string | undefined;
-  if (!secret || secret !== env.RAZORPAY_WEBHOOK_SECRET) {
+  if (!secret || !safeEqual(secret, env.RAZORPAY_WEBHOOK_SECRET)) {
     res.status(401).json({ error: 'Invalid ingest secret' });
     return;
   }
@@ -144,7 +147,7 @@ app.post('/api/ingest/receivable', async (req: Request, res: Response) => {
   }
 });
 
-app.post('/api/jobs/retry-now', async (req: Request, res: Response) => {
+app.post('/api/jobs/retry-now',requireAdmin, async (req: Request, res: Response) => {
   try {
     if (req.body?.releaseDeferred) {
       await query(
